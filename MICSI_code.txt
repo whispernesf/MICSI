@@ -1,0 +1,136 @@
+import os
+import sys
+import signal
+import random
+import numpy as np
+import pandas as pd
+import warnings
+from sklearn.model_selection import KFold
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+
+os.environ['JULIA_NUM_THREADS']    = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS']      = '1'
+signal.signal(signal.SIGINT, lambda s, f: None)
+
+try:
+    from pysr import PySRRegressor
+except Exception:
+    sys.stderr.write('Unable to import PySRRegressor. Please verify the PythonCall.jl installation.\n')
+    sys.exit(1)
+
+warnings.filterwarnings('ignore')
+GLOBAL_SEED = 42
+random.seed(GLOBAL_SEED)
+np.random.seed(GLOBAL_SEED)
+
+def load_data(path):
+    df = pd.read_excel(path)
+    return df.iloc[:, :-1], df.iloc[:, -1]
+
+def main():
+    path = '/home/eryu/machine_learning/model_test/MICSI/database_tem.xlsx'
+    if not os.path.exists(path):
+        raise FileNotFoundError(f'{path} not found')
+
+    print('Loading dataset...', flush=True)
+    X, y = load_data(path)
+    print('Feature mapping:')
+    for i, c in enumerate(X.columns):
+        print(f'  x{i} -> {c}')
+
+    param_grid = {
+        'niterations': [20, 50, 100],
+        'population_size': [20, 50, 100],
+        'parsimony': [1e-4, 1e-3, 1e-2]
+    }
+
+    pysr_args = {
+        'procs': 0,
+        'multithreading': False,
+        'deterministic': True,
+        'random_state': GLOBAL_SEED,
+        'binary_operators': ['+', '-', '*', '/', '^'],
+        'unary_operators': ['exp', 'log'],
+        'maxsize': 30,
+        'maxdepth': 5,
+        'elementwise_loss': "f(x, y) = (x - y)^2 + 1e6 * (min(x, 0))^2"
+    }
+
+    kf = KFold(n_splits=5, shuffle=True, random_state=GLOBAL_SEED)
+    total = (len(param_grid['niterations']) *
+             len(param_grid['population_size']) *
+             len(param_grid['parsimony']))
+    best_score, best_params = -np.inf, None
+    idx = 0
+
+    for ni in param_grid['niterations']:
+        for pop in param_grid['population_size']:
+            for alpha in param_grid['parsimony']:
+                idx += 1
+                print(f'[{idx}/{total}] Hyperparameter search: niter={ni}, pop={pop}, parsimony={alpha}', flush=True)
+                fold_scores = []
+                for fold, (tr, val) in enumerate(kf.split(X), start=1):
+                    print(f' Fold {fold}/5', end=' ', flush=True)
+                    X_tr, y_tr = X.values[tr], y.values[tr]
+                    X_val, y_val = X.values[val], y.values[val]
+                    try:
+                        sr = PySRRegressor(
+                            niterations=ni,
+                            population_size=pop,
+                            parsimony=alpha,
+                            verbosity=0,
+                            progress=False,
+                            **pysr_args
+                        )
+                        sr.fit(X_tr, y_tr)
+                        r2 = r2_score(y_val, sr.predict(X_val))
+                        print(f'R2={r2:.3f}', flush=True)
+                    except Exception as e:
+                        print(f'Error: {e}, R2=-inf', flush=True)
+                        r2 = -np.inf
+                    fold_scores.append(r2)
+                mean_r2 = float(np.mean(fold_scores))
+                print(f' Mean R2={mean_r2:.3f}\n', flush=True)
+                if mean_r2 > best_score:
+                    best_score = mean_r2
+                    best_params = {
+                        'niterations': ni,
+                        'population_size': pop,
+                        'parsimony': alpha
+                    }
+
+    print(f'Optimal hyperparameters: {best_params}, CV R2={best_score:.3f}\n', flush=True)
+
+    print('Training on the full dataset...', flush=True)
+    sr_final = PySRRegressor(
+        niterations=best_params['niterations'],
+        population_size=best_params['population_size'],
+        parsimony=best_params['parsimony'],
+        verbosity=1,
+        progress=True,
+        **pysr_args
+    )
+    sr_final.fit(X.values, y.values)
+    print('Evaluating candidate expressions', flush=True)
+
+    eqs = sr_final.equations_
+    results = []
+    for i, row in eqs.iterrows():
+        expr = row.get('equation') or row.get('program')
+        comp = row.get('complexity', row.get('Complexity'))
+        loss = row.get('loss', row.get('Loss'))
+        y_p = sr_final.predict(X.values, index=i)
+        results.append({
+            'expr': expr,
+            'R2': r2_score(y, y_p),
+            'MAE': mean_absolute_error(y, y_p),
+            'MSE': mean_squared_error(y, y_p),
+            'complexity': comp,
+            'loss': loss
+        })
+    df = pd.DataFrame(results).sort_values('R2', ascending=False).reset_index(drop=True)
+    print(df.to_string(index=False), flush=True)
+
+if __name__ == '__main__':
+    main()
